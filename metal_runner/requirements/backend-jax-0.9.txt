@@ -1,0 +1,4 @@
+# Known baseline used for the July 2026 feasibility gates.
+jax==0.9.1
+jaxlib==0.9.1
+jax-mps==0.9.13

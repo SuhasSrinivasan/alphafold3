@@ -315,14 +315,27 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     None,
     'Path to a directory for the JAX compilation cache.',
 )
+_JAX_BACKEND = flags.DEFINE_enum(
+    'jax_backend',
+    default='gpu',
+    enum_values=['gpu', 'mps'],
+    help=(
+        "JAX accelerator backend to use for inference. 'gpu' preserves the"
+        " existing NVIDIA CUDA path. 'mps' explicitly opts into the"
+        ' experimental JAX-MPS feasibility path on Apple Silicon and requires'
+        ' --flash_attention_implementation=xla or xla_chunked.'
+        ' --use_cpu_only overrides this flag.'
+    ),
+)
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
     0,
-    'Optional override for the GPU device to use for inference, uses zero-based'
-    ' indexing. Defaults to the 0th GPU on the system. Useful on multi-GPU'
-    ' systems to pin each run to a specific GPU. Note that if GPUs are already'
-    ' pre-filtered by the environment (e.g. by using CUDA_VISIBLE_DEVICES),'
-    ' this flag refers to the GPU index after the filtering has been done.',
+    'Optional override for the accelerator device to use for inference, using'
+    ' zero-based indexing. Defaults to the 0th device for --jax_backend.'
+    ' Useful on multi-accelerator systems to pin each run to a specific device.'
+    ' Note that if devices are already pre-filtered by the environment (e.g. by'
+    ' using CUDA_VISIBLE_DEVICES), this flag refers to the device index after'
+    ' the filtering has been done.',
 )
 _USE_CPU_ONLY = flags.DEFINE_bool(
     'use_cpu_only',
@@ -330,7 +343,7 @@ _USE_CPU_ONLY = flags.DEFINE_bool(
     'If True, use CPU only for inference. This is much slower than using a GPU,'
     ' but can be useful for testing or running on systems without a GPU'
     ' supported by JAX. If you set this flag, you must also set'
-    ' --flash_attention_implementation=xla.',
+    ' --flash_attention_implementation=xla or xla_chunked.',
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
@@ -345,14 +358,15 @@ _BUCKETS = flags.DEFINE_list(
 _FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
     'flash_attention_implementation',
     default='triton',
-    enum_values=['triton', 'cudnn', 'xla'],
+    enum_values=['triton', 'cudnn', 'xla', 'xla_chunked'],
     help=(
-        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
+        "Flash attention implementation to use. 'triton' and 'cudnn' use a"
         ' Triton and cuDNN flash attention implementation, respectively. The'
         ' Triton kernel is fastest and has been tested more thoroughly. The'
-        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
-        ' XLA attention implementation (no flash attention) and is portable'
-        ' across GPU devices.'
+        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses a"
+        " portable XLA attention implementation (no flash attention)."
+        " 'xla_chunked' is a portable, linear-memory XLA"
+        ' implementation that is generally slower than xla.'
     ),
 )
 _NUM_RECYCLES = flags.DEFINE_integer(
@@ -432,6 +446,102 @@ def make_model_config(
   config.return_embeddings = return_embeddings
   config.return_distogram = return_distogram
   return config
+
+
+_XLA_ATTENTION_IMPLEMENTATIONS = frozenset(('xla', 'xla_chunked'))
+
+
+def _local_devices_or_empty(backend: str) -> tuple[jax.Device, ...]:
+  """Returns local devices, treating an unknown JAX backend as unavailable."""
+  try:
+    return tuple(jax.local_devices(backend=backend))
+  except RuntimeError as e:
+    if str(e).startswith('Unknown backend'):
+      return ()
+    raise
+
+
+def _select_inference_device(
+    *,
+    use_cpu_only: bool,
+    accelerator_backend: str,
+    accelerator_device_index: int,
+) -> jax.Device:
+  """Selects a CPU device or a device from an explicitly chosen backend."""
+  if use_cpu_only:
+    devices = _local_devices_or_empty('cpu')
+    if not devices:
+      raise RuntimeError('No local CPU device was found.')
+    return devices[0]
+
+  devices = _local_devices_or_empty(accelerator_backend)
+  if not devices:
+    raise RuntimeError(
+        f'No local {accelerator_backend.upper()} device was found for'
+        f' --jax_backend={accelerator_backend}. Install and configure that JAX'
+        ' backend, choose another --jax_backend, or pass --use_cpu_only.'
+    )
+  if not 0 <= accelerator_device_index < len(devices):
+    raise ValueError(
+        f'--gpu_device={accelerator_device_index} is out of range for '
+        f'{len(devices)} local {accelerator_backend.upper()} device(s).'
+    )
+  return devices[accelerator_device_index]
+
+
+def _validate_inference_device(
+    device: jax.Device, flash_attention_implementation: str
+) -> None:
+  """Validates device-specific inference requirements."""
+  platform = device.platform
+  if platform in ('cpu', 'mps'):
+    if flash_attention_implementation not in _XLA_ATTENTION_IMPLEMENTATIONS:
+      raise ValueError(
+          f'For {platform.upper()} inference, '
+          '--flash_attention_implementation must be set to "xla" or '
+          '"xla_chunked".'
+      )
+    return
+
+  # This also accommodates JAX releases that report CUDA devices using the
+  # legacy "gpu" platform.
+  if platform not in ('cuda', 'gpu'):
+    raise ValueError(
+        f'Unsupported accelerator platform {platform!r}. AlphaFold 3 GPU'
+        ' inference is validated for NVIDIA CUDA; MPS is an experimental'
+        ' feasibility path.'
+    )
+
+  # CUDA devices expose an NVIDIA compute capability.
+  compute_capability = getattr(device, 'compute_capability', None)
+  if compute_capability is None:
+    raise ValueError(
+        f'Unsupported accelerator platform {platform!r}. AlphaFold 3 GPU'
+        ' inference is validated for NVIDIA CUDA; MPS is an experimental'
+        ' feasibility path.'
+    )
+  compute_capability = float(compute_capability)
+  if compute_capability < 6.0:
+    raise ValueError(
+        'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
+        ' https://developer.nvidia.com/cuda-gpus).'
+    )
+  if 7.0 <= compute_capability < 8.0:
+    xla_flags = os.environ.get('XLA_FLAGS')
+    required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
+    if not xla_flags or required_flag not in xla_flags:
+      raise ValueError(
+          'For devices with GPU compute capability 7.x (see'
+          ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
+          f' include "{required_flag}".'
+      )
+    if flash_attention_implementation not in _XLA_ATTENTION_IMPLEMENTATIONS:
+      raise ValueError(
+          'For devices with GPU compute capability 7.x (see'
+          ' https://developer.nvidia.com/cuda-gpus) the'
+          ' --flash_attention_implementation must be set to "xla" or'
+          ' "xla_chunked".'
+      )
 
 
 class ModelRunner:
@@ -920,42 +1030,17 @@ def main(_):
     print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
     raise
 
+  device = None
   if _RUN_INFERENCE.value:
     # Fail early on incompatible devices, but only if we're running inference.
-    if _USE_CPU_ONLY.value:
-      if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-        raise ValueError(
-            'For CPU-only inference, the --flash_attention_implementation must'
-            ' be set to "xla".'
-        )
-    else:
-      gpu_devices = jax.local_devices(backend='gpu')
-      if gpu_devices:
-        compute_capability = float(
-            gpu_devices[_GPU_DEVICE.value].compute_capability
-        )
-        if compute_capability < 6.0:
-          raise ValueError(
-              'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-              ' https://developer.nvidia.com/cuda-gpus).'
-          )
-        elif 7.0 <= compute_capability < 8.0:
-          xla_flags = os.environ.get('XLA_FLAGS')
-          required_flag = (
-              '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-          )
-          if not xla_flags or required_flag not in xla_flags:
-            raise ValueError(
-                'For devices with GPU compute capability 7.x (see'
-                ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS'
-                f' must include "{required_flag}".'
-            )
-          if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-            raise ValueError(
-                'For devices with GPU compute capability 7.x (see'
-                ' https://developer.nvidia.com/cuda-gpus) the'
-                ' --flash_attention_implementation must be set to "xla".'
-            )
+    device = _select_inference_device(
+        use_cpu_only=_USE_CPU_ONLY.value,
+        accelerator_backend=_JAX_BACKEND.value,
+        accelerator_device_index=_GPU_DEVICE.value,
+    )
+    _validate_inference_device(
+        device, _FLASH_ATTENTION_IMPLEMENTATION.value
+    )
 
   notice = textwrap.wrap(
       'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
@@ -1007,17 +1092,8 @@ def main(_):
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
-    if _USE_CPU_ONLY.value:
-      devices = jax.local_devices(backend='cpu')
-      device = devices[0]
-      print(f'Found local CPU devices: {devices}, using device 0: {device}')
-    else:
-      devices = jax.local_devices(backend='gpu')
-      print(
-          f'Found local GPU devices: {devices}, using device '
-          f'{_GPU_DEVICE.value}: {devices[_GPU_DEVICE.value]}'
-      )
-      device = devices[_GPU_DEVICE.value]
+    assert device is not None
+    print(f'Using inference device: {device}')
 
     print('Building model from scratch...')
     model_runner = ModelRunner(
