@@ -1,4 +1,4 @@
-# Next isolated A/B candidate. Do not install over the baseline environment.
+# Stable Apple Silicon backend validated by the July 2026 feasibility gates.
 jax==0.10.2
 jaxlib==0.10.2
 jax-mps==0.10.9

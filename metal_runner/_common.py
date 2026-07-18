@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,16 @@ def positive_int(value: str) -> int:
   if parsed <= 0:
     raise argparse.ArgumentTypeError(f'expected a positive integer: {value}')
   return parsed
+
+
+def parse_runner_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+  """Parses runner-only flags without exposing them to lazy Abseil parsing."""
+  args = parser.parse_args()
+  # Tokamax may initialize Abseil flags only when the model is first traced.
+  # At that point these diagnostic argparse flags have already been consumed;
+  # leaving them in sys.argv makes Abseil reject otherwise valid runner flags.
+  del sys.argv[1:]
+  return args
 
 
 def add_model_arguments(
@@ -256,4 +267,60 @@ def validate_and_report_result(
       float_arrays=len(float_arrays),
       ranking_score=inference_results[0].metadata['ranking_score'],
       result_keys=sorted(result),
+  )
+
+
+def save_result_artifact(*, result: dict[str, Any], output_path: Path) -> None:
+  """Saves small diagnostic predictions and per-array reproducibility hashes."""
+  output_path = output_path.expanduser().resolve()
+  if output_path.suffix != '.npz':
+    raise SystemExit('--result-npz must end in .npz')
+  if not output_path.parent.is_dir():
+    raise SystemExit(f'Result directory does not exist: {output_path.parent}')
+  arrays: dict[str, np.ndarray] = {}
+  summary: dict[str, Any] = {}
+
+  def visit(path: tuple[str, ...], value: Any) -> None:
+    name = '/'.join(path)
+    if isinstance(value, dict):
+      for key, child in sorted(value.items()):
+        visit((*path, str(key)), child)
+      return
+    if isinstance(value, bytes):
+      summary[name] = {
+          'type': 'bytes',
+          'bytes': len(value),
+          'sha256': hashlib.sha256(value).hexdigest(),
+      }
+      return
+    array = np.asarray(value)
+    arrays[name] = array
+    array_summary: dict[str, Any] = {
+        'shape': list(array.shape),
+        'dtype': str(array.dtype),
+        'bytes': array.nbytes,
+        'sha256': hashlib.sha256(array.tobytes(order='C')).hexdigest(),
+    }
+    if np.issubdtype(array.dtype, np.number):
+      array_summary.update(
+          {
+              'minimum': float(np.min(array)),
+              'maximum': float(np.max(array)),
+              'mean': float(np.mean(array)),
+              'finite': bool(np.isfinite(array).all()),
+          }
+      )
+    summary[name] = array_summary
+
+  visit((), result)
+  np.savez_compressed(output_path, **arrays)
+  summary_path = output_path.with_suffix('.summary.json')
+  summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+  emit(
+      'result_artifact_ok',
+      path=output_path,
+      arrays=len(arrays),
+      bytes=output_path.stat().st_size,
+      sha256=hashlib.sha256(output_path.read_bytes()).hexdigest(),
+      summary_path=summary_path,
   )

@@ -15,6 +15,7 @@ import numpy as np
 
 from _common import emit
 from _common import nonnegative_int
+from _common import parse_runner_args
 from _common import positive_int
 from _common import select_mps_device
 from _common import wait_for_monitor
@@ -44,7 +45,7 @@ def main() -> None:
   parser.add_argument(
       '--monitor-warmup-seconds', type=nonnegative_int, default=10
   )
-  args = parser.parse_args()
+  args = parse_runner_args(parser)
 
   emit(
       'environment',

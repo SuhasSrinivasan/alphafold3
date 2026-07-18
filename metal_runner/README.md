@@ -1,100 +1,70 @@
-# Experimental Apple Silicon GPU runners
+# Experimental AF3 inference on Apple Silicon GPU
 
-These runners reproduce the Apple Silicon GPU feasibility gates without
-modifying AlphaFold 3 model code. They are diagnostic tools, not a statement
-that MPS inference is supported or scientifically validated. The current
-baseline reaches the GPU but does not complete weighted inference; see
-[`RESULTS.md`](RESULTS.md).
+This directory contains the minimal tooling retained from the Apple Silicon
+feasibility study. JAX 0.10.2, jaxlib 0.10.2, and stable jax-mps 0.10.9 ran
+reduced AlphaFold 3 weighted inference on an Apple GPU. This remains an
+experimental backend and has not been numerically validated against CUDA. A
+complete MSA-free `run_alphafold.py` test also passed for the 460-residue 5EXA
+A/B homodimer using the current AF3 defaults of 10 recycles and 5 diffusion
+samples.
 
-## Layout
+Start with [AI_AGENT_SETUP.md](AI_AGENT_SETUP.md). It gives a reproducible
+native macOS source build, patched HMMER and database setup, monitored smoke
+tests, complete CLI gates, and a full MSA/template pipeline workflow.
+[RESULTS.md](RESULTS.md) records the evidence, the bounded explanation of the
+old Metal timeout, and the remaining validation work.
 
-- `backend_gate.py`: reports dependency versions and tests MPS discovery, JIT,
-  transfers, BF16 matmul, `lax.scan`, and `lax.while_loop`.
-- `no_msa_gate.py`: constructs and featurises a two-protein query-only MSA input
-  without sequence databases.
-- `weight_load_gate.py`: loads licensed parameters onto `MPS:0` without running
-  inference.
-- `weighted_fixture_smoke.py`: runs a reduced weighted test using AF3's trusted
-  150-token fixture.
-- `weighted_no_msa_smoke.py`: runs the smallest database-free weighted dimer
-  used in the initial investigation.
-- `run_with_mactop.py`: records workload output, per-process RSS, and `mactop`
-  CSV samples requested at a one-second interval. It terminates the workload if
-  process RSS exceeds the configured safety limit.
-- `requirements/`: exact backend triplets for the known baseline and next A/B
-  candidate. These files intentionally do not install AF3 or its licensed
-  weights.
+## Retained files
 
-All scripts emit JSON progress records so results from different dependency
-stacks can be compared mechanically. Run each Metal watchdog experiment in a
-fresh process.
+- `requirements/backend-jax-0.10.txt`: the selected stable backend versions.
+- `backend_gate.py`: MPS discovery, JIT, transfers, BF16 matrix multiplication,
+  `lax.scan`, and `lax.while_loop`.
+- `weighted_no_msa_smoke.py` and `_common.py`: a reduced, weighted,
+  database-free protein-dimer inference test. It uses AF3's real
+  `ModelRunner`, parameters, featurisation, inference, and result extraction.
+- `run_with_mactop.py` and `mps_health_gate.py`: synchronized workload logs,
+  one-second `mactop` telemetry, process-group RSS limits, recovery sampling,
+  postflight GPU health, environment metadata, and a SHA-256 manifest.
+- `compare_results.py`: array-level comparison of saved MPS and CUDA prediction
+  archives.
+- `examples/msa_free_dimer.json`: minimal query-only JSON for the fast CLI
+  gate.
+- `examples/full_pipeline_5exa_ab.json`: full 5EXA A/B homodimer input with
+  MSA/template fields deliberately omitted so the normal database pipeline
+  performs genetic and template searches.
 
-## Inputs and safety
+The old 0.9 backend pin, development build pin, standalone MSA/weight gates,
+and test-fixture-only runner were intentionally removed after stable 0.10.9
+passed the combined weighted gate.
 
-Set the model directory to the directory containing `af3.bin.zst`, not the
-compressed file itself:
+## Safety and evidence
 
-```bash
-export AF3_MODEL_DIR=/path/to/weights
-```
+The monitor refuses to reuse an output directory. Its default absolute
+process-group RSS ceiling is 32 GiB, with an early stop at 30 GiB. Unified GPU
+allocations are not necessarily fully represented by process RSS, so inspect
+both `run.json` and `mactop_summary.json` before increasing model size or memory
+limits.
 
-The monitor refuses to reuse an output directory, preserving earlier evidence.
-Its default process-RSS limit is 32 GiB. GPU allocations use unified memory and
-may not all be attributed to process RSS, so also inspect `mactop.csv` before
-increasing token counts or model settings.
+`mactop.csv` can contain process, volume, display, network, and other host
+fields. Treat it as private. `mactop.selected.csv` and `mactop.process.csv` are
+the reduced files intended for review or an upstream issue.
 
-## Recommended gate order
+Local artifacts belong under `metal_runner/results/`, which is gitignored.
+Never delete or overwrite an earlier run; use a new run name.
 
-Run the database-free featurisation gate first:
+## Scope boundary
 
-```bash
-python metal_runner/no_msa_gate.py
-```
+No Docker image is used on macOS because Linux containers do not expose the
+Apple Metal GPU to JAX. The validated path installs the AF3 Python package and
+chemical-component data natively, replaces the CUDA JAX backend with jax-mps,
+and invokes repository scripts with that environment's Python.
 
-Run hardware gates under monitoring:
-
-```bash
-python metal_runner/run_with_mactop.py \
-  --output-dir metal_runner/results/jax-0.9-backend \
-  --max-rss-gib 32 \
-  -- python metal_runner/backend_gate.py
-
-python metal_runner/run_with_mactop.py \
-  --output-dir metal_runner/results/jax-0.9-weights \
-  --max-rss-gib 32 \
-  -- python metal_runner/weight_load_gate.py
-```
-
-The weighted runners are expected to abort with a Metal watchdog timeout on the
-recorded 0.9 baseline. They should only be retried intentionally:
-
-```bash
-python metal_runner/run_with_mactop.py \
-  --output-dir metal_runner/results/jax-0.10-no-msa \
-  --max-rss-gib 32 \
-  -- python metal_runner/weighted_no_msa_smoke.py
-```
-
-Use `--help` on every script for configurable sequences, bucket, attention,
-recycles, diffusion steps, fixture path, and monitoring delays.
-
-## Next JAX A/B environment
-
-Keep the working JAX 0.9.1/jax-mps 0.9.13 environment unchanged. Create a
-separate Python 3.13 environment, install AF3 and its normal dependencies, then
-override only the backend triplet with
-`requirements/backend-jax-0.10.txt`. AF3 currently pins JAX 0.9.1, so this is an
-intentional compatibility experiment rather than a supported dependency update.
-
-For an interpretable comparison:
-
-1. Keep `JAX_MPS_ASYNC_DISPATCH` disabled initially.
-2. Run `backend_gate.py`, `no_msa_gate.py`, and `weight_load_gate.py`.
-3. Run the exact 18-token weighted MSA-free case with the same seed and config.
-4. If it completes, increase diffusion steps before increasing token count.
-5. If it still times out, capture a Metal trace and isolate target embedding,
-   one Evoformer recycle, one diffusion step, and one confidence sample before
-   attempting invasive layer-stack changes.
-
-For later numerical validation, run Linux CUDA and MPS against the same
-pipeline-augmented `*_data.json`, seed, weights, and model configuration.
+The reduced weighted smoke test remains useful because it uses four diffusion
+steps and can use zero recycles. The official `run_alphafold.py` path has now
+also passed locally: query-only 5EXA chains A/B (230 residues each), one input
+seed, 10 default recycles, 5 default diffusion samples, the normal 200
+diffusion steps per sample, and an automatic 512-token bucket. It wrote the
+standard AF3 output tree in 165.17 seconds, peaked at 5.57 GiB process-group
+RSS, and completed without a Metal timeout or swap. See `RESULTS.md` for the
+scientific and telemetry audit. CUDA agreement and broader reliability remain
+open validation work.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import time
 
 import jax
@@ -16,9 +17,11 @@ from _common import block_and_report_parameters
 from _common import emit
 from _common import featurise_msa_free_dimer
 from _common import nonnegative_int
+from _common import parse_runner_args
 from _common import positive_int
 from _common import require_model_dir
 from _common import run_alphafold
+from _common import save_result_artifact
 from _common import select_mps_device
 from _common import validate_and_report_result
 from _common import wait_for_monitor
@@ -33,7 +36,8 @@ def main() -> None:
   parser.add_argument('--bucket', type=positive_int, default=18)
   parser.add_argument('--num-recycles', type=nonnegative_int, default=0)
   parser.add_argument('--diffusion-steps', type=positive_int, default=4)
-  args = parser.parse_args()
+  parser.add_argument('--result-npz', type=Path)
+  args = parse_runner_args(parser)
   model_dir = require_model_dir(args.model_dir)
 
   emit('process', pid=os.getpid())
@@ -76,6 +80,8 @@ def main() -> None:
       num_tokens=num_tokens,
       elapsed=time.monotonic() - start,
   )
+  if args.result_npz is not None:
+    save_result_artifact(result=result, output_path=args.result_npz)
   if args.cooldown_seconds:
     time.sleep(args.cooldown_seconds)
 
