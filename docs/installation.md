@@ -264,17 +264,13 @@ You can use theses two scripts:
 
 ## Obtaining Model Parameters
 
-To request access to the AlphaFold 3 model parameters, please complete
-[this form](https://forms.gle/svvpY4u2jsHEwWYS6). Access will be granted at
-Google DeepMind’s sole discretion. We will aim to respond to requests within 2–3
-business days. You may only use AlphaFold 3 model parameters if received
-directly from Google. Use is subject to these
+You can download the AlphaFold 3 model parameters from
+https://storage.googleapis.com/alphafold3/af3.bin.zst. Use is subject to these
 [terms of use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md).
 
-Once access has been granted, download the model parameters to a directory of
-your choosing, referred to as `<MODEL_PARAMETERS_DIR>` in the following
-instructions. As with the databases, this should *not* be a subdirectory in the
-AlphaFold 3 repository directory.
+Download the model parameters to a directory of your choosing, referred to as
+`<MODEL_PARAMETERS_DIR>` in the following instructions. As with the databases,
+this should *not* be a subdirectory in the AlphaFold 3 repository directory.
 
 ## Building the Docker Container That Will Run AlphaFold 3
 
@@ -496,6 +492,13 @@ Since JAX doesn't support running natively on Mac GPU as of 2026, you have to
 resort to running AlphaFold 3 in the slow CPU-only mode even though it has a GPU
 (`jax-metal` is unfinished as of July 2026).
 
+> **Experimental Apple Silicon GPU (Metal / MPS) inference.** As an alternative
+> to CPU-only mode, AlphaFold 3 inference can run on the Apple Silicon GPU with
+> `--jax_backend=mps` via the community `jax-mps` Metal plugin. This is an
+> unofficial, experimental feasibility path (not numerically certified), but it
+> is substantially faster than CPU for small and medium structures. See
+> [installation_apple_silicon_gpu.md](installation_apple_silicon_gpu.md).
+
 1.  Download all required databases and AlphaFold 3 weights (see above).
 2.  Install the [HMMER Suite](http://hmmer.org/). See
     http://hmmer.org/documentation.html for installation instructions.
@@ -525,14 +528,14 @@ resort to running AlphaFold 3 in the slow CPU-only mode even though it has a GPU
     uv run python run_alphafold_data_test.py
     ```
 
-7.  You can now run AlphaFold 3. The flags that need to be set for CPU-only
-    inference are `--use_cpu_only` and `--flash_attention_implementation="xla"`:
+7.  You can now run AlphaFold 3. Make sure to set flags `--jax_backend="cpu"`
+    and `--flash_attention_implementation="xla"`:
 
     ```sh
     uv run run_alphafold.py \
       --json_path="..." \
       --output_dir="..." \
       --model_dir="..."
-      --use_cpu_only \
+      --jax_backend="cpu" \
       --flash_attention_implementation="xla" \
     ```
